@@ -56,21 +56,37 @@ matrixMulCUDA(float *C, float *A, float *B, int wA, int wB)
     C[c + wB * ty + tx] = Csub;
 }
 
-template <int BLOCK_SIZE> __global__ void
+__global__ void
 MatrixMultiplyKernel_GlobalMem(float* C, const float* A, const float* B, unsigned int matrixDim)
 {
-	// Compute the row index
-	unsigned int i = (blockDim.y * blockIdx.y) + threadIdx.y;
-	// Compute the column index
-	unsigned int j = (blockDim.x * blockIdx.x) + threadIdx.x;
+	unsigned int squareBlockDim = blockDim.x;
 
-	unsigned int index = (i * matrixDim) + j;
+	// Compute the row index
+	unsigned int i = (squareBlockDim * blockIdx.y) + threadIdx.y;
+	// Compute the column index
+	unsigned int j = (squareBlockDim * blockIdx.x) + threadIdx.x;
+
+	//unsigned int index = (i * matrixDim) + j;
 	float sum = 0.0f;
-	for (unsigned int k = 0; k < matrixDim; ++k)
+
+	for (unsigned int x = i; x < matrixDim; x+=squareBlockDim)
 	{
-		sum += A[i * matrixDim + k] * B[k * matrixDim + j];
+		for (unsigned int y = j; y < matrixDim; y+=squareBlockDim)
+		{
+			for (unsigned int k = 0; k < matrixDim; ++k)
+			{
+				sum += A[x * matrixDim + k] * B[k * matrixDim + y];
+			}
+			C[(x * matrixDim) + y] = sum;
+			sum = 0;
+		}
 	}
-	C[index] = sum;
+
+	//for (unsigned int k = 0; k < matrixDim; ++k)
+	//{
+	//	sum += A[i * matrixDim + k] * B[k * matrixDim + j];
+	//}
+	//C[index] = sum;
 }
 
 void constantInit(float *data, int size, float val)
@@ -158,7 +174,8 @@ int matrixMultiply(int argc, char **argv, int block_size, dim3 &dimsA, dim3 &dim
 
     // Setup execution parameters
     dim3 threads(block_size, block_size);
-    dim3 grid(dimsB.x / threads.x, dimsA.y / threads.y);
+    /*dim3 grid(dimsB.x / threads.x, dimsA.y / threads.y);*/
+	dim3 grid(1, 1);
 
     cudaDeviceSynchronize();
 
@@ -192,10 +209,10 @@ int matrixMultiply(int argc, char **argv, int block_size, dim3 &dimsA, dim3 &dim
 	}
 #pragma endregion
 
-    int nIter = 300;
+    int nIter = 1;
     for (int j = 0; j < nIter; j++)
     {
-		MatrixMultiplyKernel_GlobalMem<32> <<< grid, threads>>>(d_C, d_A, d_B, dimsA.x);
+		MatrixMultiplyKernel_GlobalMem <<< grid, threads>>>(d_C, d_A, d_B, dimsA.x);
     }
 
 #pragma region Error handling
@@ -227,7 +244,6 @@ int matrixMultiply(int argc, char **argv, int block_size, dim3 &dimsA, dim3 &dim
     }
 #pragma endregion
 
-
 #pragma region countPerformance
 	float msecPerMatrixMul = msecTotal / nIter;
 	double flopsPerMatrixMul = 2.0 * (double)dimsA.x * (double)dimsA.y * (double)dimsB.x;
@@ -239,7 +255,6 @@ int matrixMultiply(int argc, char **argv, int block_size, dim3 &dimsA, dim3 &dim
 		flopsPerMatrixMul,
 		threads.x * threads.y);
 #pragma endregion
-
 
 #pragma region copy result to host
 	// Copy result from device to host
@@ -253,6 +268,14 @@ int matrixMultiply(int argc, char **argv, int block_size, dim3 &dimsA, dim3 &dim
 #pragma endregion
 
 #pragma region verifyResult
+
+	/*for (int i = 0; i < dimsA.x; i++) {
+		for (int j = 0; j < dimsA.x; j++) {
+			std::cout << h_C[i + j] << " ";
+		}
+		std::cout << std::endl;
+	}*/
+
 	printf("Checking computed result for correctness: ");
 	bool correct = true;
 
@@ -275,7 +298,6 @@ int matrixMultiply(int argc, char **argv, int block_size, dim3 &dimsA, dim3 &dim
 	}
 #pragma endregion
 
-
 #pragma region clean
 	printf("%s\n", correct ? "Result = PASS" : "Result = FAIL");
 
@@ -286,9 +308,6 @@ int matrixMultiply(int argc, char **argv, int block_size, dim3 &dimsA, dim3 &dim
 	cudaFree(d_A);
 	cudaFree(d_B);
 	cudaFree(d_C);
-
-	printf("\nNOTE: The CUDA Samples are not meant for performance measurements. Results may vary when GPU Boost is enabled.\n");
-
 	if (correct)
 	{
 		return EXIT_SUCCESS;
@@ -356,10 +375,10 @@ int main(int argc, char **argv)
 	std::cout << "Block size: " << block_size << "\n";
 #pragma endregion
 
-	int matrixDim = 5 * 2 *  block_size;
+	int matrixDim = 10 * block_size;
     dim3 dimsA(matrixDim, matrixDim, 1);
     dim3 dimsB(matrixDim, matrixDim, 1);
-
+	
 #pragma region ReadArgs
     // width of Matrix A
     if (checkCmdLineFlag(argc, (const char **)argv, "wA"))
@@ -396,6 +415,5 @@ int main(int argc, char **argv)
 #pragma endregion
 
     int matrix_result = matrixMultiply(argc, argv, block_size, dimsA, dimsB);
-	system("pause");
-    exit(matrix_result);
+	//system("pause");
 }
