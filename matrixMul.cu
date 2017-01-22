@@ -4,6 +4,39 @@
 #include <helper_functions.h>
 #include <helper_cuda.h>
 
+__global__ void
+MatrixMultiplyKernel_GlobalMem(float* C, const float* A, const float* B, unsigned int matrixDim)
+{
+	unsigned int squareBlockDim = blockDim.x;
+
+	// Compute the row index
+	unsigned int i = (squareBlockDim * blockIdx.y) + threadIdx.y;
+	// Compute the column index
+	unsigned int j = (squareBlockDim * blockIdx.x) + threadIdx.x;
+
+	//unsigned int index = (i * matrixDim) + j;
+	float sum = 0.0f;
+
+	for (unsigned int x = i; x < matrixDim; x+=squareBlockDim)
+	{
+		for (unsigned int y = j; y < matrixDim; y+=squareBlockDim)
+		{
+			for (unsigned int k = 0; k < matrixDim; ++k)
+			{
+				sum += A[x * matrixDim + k] * B[k * matrixDim + y];
+			}
+			C[(x * matrixDim) + y] = sum;
+			sum = 0;
+		}
+	}
+
+	//for (unsigned int k = 0; k < matrixDim; ++k)
+	//{
+	//	sum += A[i * matrixDim + k] * B[k * matrixDim + j];
+	//}
+	//C[index] = sum;
+}
+
 template <int BLOCK_SIZE> __global__ void
 matrixMulCUDA(float *C, float *A, float *B, int wA, int wB)
 {
@@ -56,37 +89,62 @@ matrixMulCUDA(float *C, float *A, float *B, int wA, int wB)
     C[c + wB * ty + tx] = Csub;
 }
 
-__global__ void
-MatrixMultiplyKernel_GlobalMem(float* C, const float* A, const float* B, unsigned int matrixDim)
+template <int BLOCK_SIZE> __global__ void
+matrixNeighboursMul(float *C, float *A, float *B, int wA, int wB)
 {
-	unsigned int squareBlockDim = blockDim.x;
+	// Block index
+	int bx = blockIdx.x;
+	int by = blockIdx.y;
 
-	// Compute the row index
-	unsigned int i = (squareBlockDim * blockIdx.y) + threadIdx.y;
-	// Compute the column index
-	unsigned int j = (squareBlockDim * blockIdx.x) + threadIdx.x;
+	// Thread index
+	int tx = threadIdx.x;
+	int ty = threadIdx.y;
 
-	//unsigned int index = (i * matrixDim) + j;
-	float sum = 0.0f;
+	int aBegin = wA * BLOCK_SIZE * by;
+	int aEnd = aBegin + wA - 1;
 
-	for (unsigned int x = i; x < matrixDim; x+=squareBlockDim)
-	{
-		for (unsigned int y = j; y < matrixDim; y+=squareBlockDim)
-		{
-			for (unsigned int k = 0; k < matrixDim; ++k)
-			{
-				sum += A[x * matrixDim + k] * B[k * matrixDim + y];
-			}
-			C[(x * matrixDim) + y] = sum;
-			sum = 0;
-		}
+	// Step size used to iterate through the sub-matrices of A
+	int aStep = BLOCK_SIZE;
+
+	int bBegin = BLOCK_SIZE * bx;
+	int bStep = BLOCK_SIZE * wB;
+
+	// Csub is used to store the element of the block sub-matrix
+	// that is computed by the thread
+	float Csub[BLOCK_SIZE];
+	for (int z = 0; z < BLOCK_SIZE; z++) {
+		Csub[z] = 0;
 	}
 
-	//for (unsigned int k = 0; k < matrixDim; ++k)
-	//{
-	//	sum += A[i * matrixDim + k] * B[k * matrixDim + j];
-	//}
-	//C[index] = sum;
+	// Loop over all the sub-matrices of A and B
+	// required to compute the block sub-matrix
+	for (int a = aBegin, b = bBegin;
+		a <= aEnd;
+		a += aStep, b += bStep)
+	{
+		__shared__ float As[BLOCK_SIZE][BLOCK_SIZE];
+		__shared__ float Bs[BLOCK_SIZE][BLOCK_SIZE];
+
+		As[ty][tx] = A[a + wA * ty + tx];
+		Bs[ty][tx] = B[b + wB * ty + tx];
+
+		__syncthreads();
+#pragma unroll
+		for (int z = 0; z < BLOCK_SIZE; ++z) {
+			for (int k = 0; k < BLOCK_SIZE; ++k) {
+				Csub[z] += As[ty][k] * Bs[k][z];
+			}
+		}
+
+		__syncthreads();
+	}
+
+	// Write the block sub-matrix to device memory;
+	// each thread writes one element
+	for (int z = 0; z < BLOCK_SIZE; ++z) {
+		int c = wB * BLOCK_SIZE * by + BLOCK_SIZE * bx;
+		C[c + wB * ty + z] = Csub[z];
+	}
 }
 
 void constantInit(float *data, int size, float val)
@@ -96,7 +154,6 @@ void constantInit(float *data, int size, float val)
         data[i] = val;
     }
 }
-
 
 int matrixMultiply(int argc, char **argv, int block_size, dim3 &dimsA, dim3 &dimsB)
 {
@@ -174,8 +231,8 @@ int matrixMultiply(int argc, char **argv, int block_size, dim3 &dimsA, dim3 &dim
 
     // Setup execution parameters
     dim3 threads(block_size, block_size);
-    /*dim3 grid(dimsB.x / threads.x, dimsA.y / threads.y);*/
-	dim3 grid(1, 1);
+    dim3 grid(dimsB.x / threads.x, dimsA.y / threads.y);
+	//dim3 grid(1, 1);
 
     cudaDeviceSynchronize();
 
@@ -212,7 +269,9 @@ int matrixMultiply(int argc, char **argv, int block_size, dim3 &dimsA, dim3 &dim
     int nIter = 1;
     for (int j = 0; j < nIter; j++)
     {
-		MatrixMultiplyKernel_GlobalMem <<< grid, threads>>>(d_C, d_A, d_B, dimsA.x);
+		//MatrixMultiplyKernel_GlobalMem <<< grid, threads>>>(d_C, d_A, d_B, dimsA.x);
+		//matrixMulCUDA<32><<<grid, threads>>>(d_C, d_A, d_B, dimsA.x, dimsB.x);
+		matrixNeighboursMul<32> <<<grid, dim3(1, 32, 1)>>> (d_C, d_A, d_B, dimsA.x, dimsB.x);
     }
 
 #pragma region Error handling
