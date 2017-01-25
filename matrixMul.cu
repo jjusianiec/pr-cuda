@@ -4,6 +4,14 @@
 #include <helper_functions.h>
 #include <helper_cuda.h>
 
+#define BLOCK_SIZE 32
+
+
+#define SUB_MATRIX_THREAD 1
+#define ZAD5_BLOCK_SIZE 32
+#define MATRIX_SIZE 320
+
+
 __global__ void
 MatrixMultiplyKernel_GlobalMem(float* C, const float* A, const float* B, unsigned int matrixDim)
 {
@@ -29,16 +37,10 @@ MatrixMultiplyKernel_GlobalMem(float* C, const float* A, const float* B, unsigne
 			sum = 0;
 		}
 	}
-
-	//for (unsigned int k = 0; k < matrixDim; ++k)
-	//{
-	//	sum += A[i * matrixDim + k] * B[k * matrixDim + j];
-	//}
-	//C[index] = sum;
 }
 
-template <int BLOCK_SIZE> __global__ void
-matrixMulCUDA(float *C, float *A, float *B, int wA, int wB)
+__global__ void
+matrixMulSharedMultiBlock(float *C, float *A, float *B, int wA, int wB)
 {
     // Block index
     int bx = blockIdx.x;
@@ -59,7 +61,11 @@ matrixMulCUDA(float *C, float *A, float *B, int wA, int wB)
 
     // Csub is used to store the element of the block sub-matrix
     // that is computed by the thread
-    float Csub = 0;
+	float Csub[1];
+	Csub[0] = 0;
+
+    __shared__ float As[BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ float Bs[BLOCK_SIZE][BLOCK_SIZE];
 
     // Loop over all the sub-matrices of A and B
     // required to compute the block sub-matrix
@@ -67,9 +73,6 @@ matrixMulCUDA(float *C, float *A, float *B, int wA, int wB)
          a <= aEnd;
          a += aStep, b += bStep)
     {
-        __shared__ float As[BLOCK_SIZE][BLOCK_SIZE];
-        __shared__ float Bs[BLOCK_SIZE][BLOCK_SIZE];
-
         As[ty][tx] = A[a + wA * ty + tx];
         Bs[ty][tx] = B[b + wB * ty + tx];
 
@@ -77,75 +80,113 @@ matrixMulCUDA(float *C, float *A, float *B, int wA, int wB)
 #pragma unroll
         for (int k = 0; k < BLOCK_SIZE; ++k)
         {
-            Csub += As[ty][k] * Bs[k][tx];
+            Csub[0] += As[ty][k] * Bs[k][tx];
         }
-
         __syncthreads();
     }
 
     // Write the block sub-matrix to device memory;
     // each thread writes one element
     int c = wB * BLOCK_SIZE * by + BLOCK_SIZE * bx;
-    C[c + wB * ty + tx] = Csub;
+    C[c + wB * ty + tx] = Csub[0];
 }
 
-template <int BLOCK_SIZE> __global__ void
-matrixNeighboursMul(float *C, float *A, float *B, int wA, int wB)
+__global__ void
+matrixMulNeighbours(float *C, float *A, float *B, int wA, int wB)
 {
+	int subSize = blockDim.x * SUB_MATRIX_THREAD;
 	// Block index
 	int bx = blockIdx.x;
 	int by = blockIdx.y;
 
 	// Thread index
-	int tx = threadIdx.x;
-	int ty = threadIdx.y;
+	int tx = threadIdx.x * SUB_MATRIX_THREAD;
+	int ty = threadIdx.y * SUB_MATRIX_THREAD;
 
-	int aBegin = wA * BLOCK_SIZE * by;
+	int aBegin = wA * by * subSize;
 	int aEnd = aBegin + wA - 1;
 
 	// Step size used to iterate through the sub-matrices of A
-	int aStep = BLOCK_SIZE;
+	int aStep = subSize;
 
-	int bBegin = BLOCK_SIZE * bx;
-	int bStep = BLOCK_SIZE * wB;
+	int bBegin = subSize * bx;
+	int bStep = subSize * wB;
 
-	// Csub is used to store the element of the block sub-matrix
-	// that is computed by the thread
-	float Csub[BLOCK_SIZE];
-	for (int z = 0; z < BLOCK_SIZE; z++) {
-		Csub[z] = 0;
+	float Csub[SUB_MATRIX_THREAD * SUB_MATRIX_THREAD];
+	for (int i = 0; i < subSize; i++)
+	{
+		for (int j = 0; j < subSize; j++)
+		{
+			Csub[i * SUB_MATRIX_THREAD + j] = 0;
+		}
 	}
 
 	// Loop over all the sub-matrices of A and B
 	// required to compute the block sub-matrix
+	__shared__ float As[ZAD5_BLOCK_SIZE * SUB_MATRIX_THREAD][ZAD5_BLOCK_SIZE * SUB_MATRIX_THREAD];
+	__shared__ float Bs[ZAD5_BLOCK_SIZE * SUB_MATRIX_THREAD][ZAD5_BLOCK_SIZE * SUB_MATRIX_THREAD];
+
 	for (int a = aBegin, b = bBegin;
 		a <= aEnd;
 		a += aStep, b += bStep)
 	{
-		__shared__ float As[BLOCK_SIZE][BLOCK_SIZE];
-		__shared__ float Bs[BLOCK_SIZE][BLOCK_SIZE];
-
-		As[ty][tx] = A[a + wA * ty + tx];
-		Bs[ty][tx] = B[b + wB * ty + tx];
-
-		__syncthreads();
 #pragma unroll
-		for (int z = 0; z < BLOCK_SIZE; ++z) {
-			for (int k = 0; k < BLOCK_SIZE; ++k) {
-				Csub[z] += As[ty][k] * Bs[k][z];
+		for (int i = 0; i < SUB_MATRIX_THREAD; ++i)
+		{
+#pragma unroll
+			for (int j = 0; j < SUB_MATRIX_THREAD; ++j)
+			{
+				As[ty + i][tx + j] = A[a + wA * (ty + i) + tx + j];
+				Bs[ty + i][tx + j] = B[b + wB * (ty + i) + tx + j];
 			}
 		}
-
+		__syncthreads();
+#pragma unroll
+		for (int i = 0; i < SUB_MATRIX_THREAD; ++i)
+		{
+#pragma unroll
+			for (int j = 0; j < SUB_MATRIX_THREAD; ++j)
+			{
+#pragma unroll
+				for (int k = 0; k < subSize; ++k)
+				{
+					Csub[i * SUB_MATRIX_THREAD + j] += As[ty + i][k] * Bs[k][tx + j];
+				}
+			}
+		}
 		__syncthreads();
 	}
 
 	// Write the block sub-matrix to device memory;
 	// each thread writes one element
-	for (int z = 0; z < BLOCK_SIZE; ++z) {
-		int c = wB * BLOCK_SIZE * by + BLOCK_SIZE * bx;
-		C[c + wB * ty + z] = Csub[z];
+	for (int i = 0; i < SUB_MATRIX_THREAD; ++i)
+	{
+		for (int j = 0; j < SUB_MATRIX_THREAD; ++j)
+		{
+			int c = wB * subSize * by + subSize * bx;
+			C[c + wB * (ty + i) + tx + j] = Csub[i * SUB_MATRIX_THREAD + j];
+		}
 	}
 }
+
+
+__global__ void matrixMulGlobalMem(float* Cd, float* Ad, float* Bd, int width)
+{
+	float tmpC = 0;
+#pragma unroll
+	for (int ty = threadIdx.y; ty < width; ty += BLOCK_SIZE){
+#pragma unroll
+		for (int tx = threadIdx.x; tx < width; tx += BLOCK_SIZE){
+			tmpC = 0;
+#pragma unroll
+			for (int k = 0; k < width; ++k){
+				tmpC += Ad[ty * width + k] * Bd[k * width + tx];
+			}
+			Cd[ty * width + tx] = tmpC;
+		}
+	}
+}
+
 
 void constantInit(float *data, int size, float val)
 {
@@ -230,11 +271,15 @@ int matrixMultiply(int argc, char **argv, int block_size, dim3 &dimsA, dim3 &dim
 #pragma endregion
 
     // Setup execution parameters
-    dim3 threads(block_size, block_size);
-    dim3 grid(dimsB.x / threads.x, dimsA.y / threads.y);
-	//dim3 grid(1, 1);
+	//dim3 grid(1, 1); //zad1
+    
+    dim3 threads(BLOCK_SIZE, BLOCK_SIZE);
+	dim3 grid(dimsB.x / threads.x , dimsA.y / threads.y); // zad3
 
-    cudaDeviceSynchronize();
+	//dim3 threads(ZAD5_BLOCK_SIZE, ZAD5_BLOCK_SIZE);
+	//dim3 grid(dimsB.x / (threads.x * SUB_MATRIX_THREAD), dimsA.y / (threads.y * SUB_MATRIX_THREAD));
+
+	cudaDeviceSynchronize();
 
 #pragma region initEvents
 	// Allocate CUDA events that we'll use for timing
@@ -269,10 +314,10 @@ int matrixMultiply(int argc, char **argv, int block_size, dim3 &dimsA, dim3 &dim
     int nIter = 1;
     for (int j = 0; j < nIter; j++)
     {
-		//MatrixMultiplyKernel_GlobalMem <<< grid, threads>>>(d_C, d_A, d_B, dimsA.x);
-		//matrixMulCUDA<32><<<grid, threads>>>(d_C, d_A, d_B, dimsA.x, dimsB.x);
-		matrixNeighboursMul<32> <<<grid, dim3(1, 32, 1)>>> (d_C, d_A, d_B, dimsA.x, dimsB.x);
-    }
+		//matrixMulGlobalMem<<< grid, threads >>>(d_C, d_A, d_B, dimsA.x);					//zad1
+		matrixMulSharedMultiBlock<<<grid, threads>>>(d_C, d_A, d_B, dimsA.x, dimsB.x);				//zad3
+		//matrixMulNeighbours <<< grid, threads >>> (d_C, d_A, d_B, dimsA.x, dimsB.x);		//zad5
+	}
 
 #pragma region Error handling
     // Record the stop event
@@ -327,13 +372,6 @@ int matrixMultiply(int argc, char **argv, int block_size, dim3 &dimsA, dim3 &dim
 #pragma endregion
 
 #pragma region verifyResult
-
-	/*for (int i = 0; i < dimsA.x; i++) {
-		for (int j = 0; j < dimsA.x; j++) {
-			std::cout << h_C[i + j] << " ";
-		}
-		std::cout << std::endl;
-	}*/
 
 	printf("Checking computed result for correctness: ");
 	bool correct = true;
@@ -429,12 +467,12 @@ int main(int argc, char **argv)
         printf("GPU Device %d: \"%s\" with compute capability %d.%d\n\n", devID, deviceProp.name, deviceProp.major, deviceProp.minor);
     }
 
-    // Use a larger block size for Fermi and above
-    int block_size = (deviceProp.major < 2) ? 16 : 32;
-	std::cout << "Block size: " << block_size << "\n";
+
+	std::cout << "Block size: " << BLOCK_SIZE << "\n";
 #pragma endregion
 
-	int matrixDim = 10 * block_size;
+	int matrixDim = MATRIX_SIZE; //zad 1 3
+	//int matrixDim = SUB_MATRIX_THREAD * ZAD5_BLOCK_SIZE * 10; //zad 5
     dim3 dimsA(matrixDim, matrixDim, 1);
     dim3 dimsB(matrixDim, matrixDim, 1);
 	
@@ -473,6 +511,7 @@ int main(int argc, char **argv)
     printf("MatrixA(%d,%d), MatrixB(%d,%d)\n", dimsA.x, dimsA.y, dimsB.x, dimsB.y);
 #pragma endregion
 
-    int matrix_result = matrixMultiply(argc, argv, block_size, dimsA, dimsB);
+    int matrix_result = matrixMultiply(argc, argv, BLOCK_SIZE, dimsA, dimsB); //zad 1 3
+	//int matrix_result = matrixMultiply(argc, argv, ZAD5_BLOCK_SIZE, dimsA, dimsB); //zad5
 	//system("pause");
 }
