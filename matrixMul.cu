@@ -7,9 +7,9 @@
 #define BLOCK_SIZE 32
 
 
-#define SUB_MATRIX_THREAD 1
-#define ZAD5_BLOCK_SIZE 32
-#define MATRIX_SIZE 320
+#define SUB_MATRIX_THREAD 2
+#define ZAD5_BLOCK_SIZE 16
+#define MATRIX_SIZE 1024
 
 
 __global__ void
@@ -61,8 +61,7 @@ matrixMulSharedMultiBlock(float *C, float *A, float *B, int wA, int wB)
 
     // Csub is used to store the element of the block sub-matrix
     // that is computed by the thread
-	float Csub[1];
-	Csub[0] = 0;
+	float Csub = 0;
 
     __shared__ float As[BLOCK_SIZE][BLOCK_SIZE];
     __shared__ float Bs[BLOCK_SIZE][BLOCK_SIZE];
@@ -80,15 +79,15 @@ matrixMulSharedMultiBlock(float *C, float *A, float *B, int wA, int wB)
 #pragma unroll
         for (int k = 0; k < BLOCK_SIZE; ++k)
         {
-            Csub[0] += As[ty][k] * Bs[k][tx];
+            Csub += As[ty][k] * Bs[k][tx];
         }
         __syncthreads();
-    }
+	}
 
     // Write the block sub-matrix to device memory;
     // each thread writes one element
     int c = wB * BLOCK_SIZE * by + BLOCK_SIZE * bx;
-    C[c + wB * ty + tx] = Csub[0];
+    C[c + wB * ty + tx] = Csub;
 }
 
 __global__ void
@@ -113,9 +112,9 @@ matrixMulNeighbours(float *C, float *A, float *B, int wA, int wB)
 	int bStep = subSize * wB;
 
 	float Csub[SUB_MATRIX_THREAD * SUB_MATRIX_THREAD];
-	for (int i = 0; i < subSize; i++)
+	for (int i = 0; i < SUB_MATRIX_THREAD; i++)
 	{
-		for (int j = 0; j < subSize; j++)
+		for (int j = 0; j < SUB_MATRIX_THREAD; j++)
 		{
 			Csub[i * SUB_MATRIX_THREAD + j] = 0;
 		}
@@ -273,11 +272,11 @@ int matrixMultiply(int argc, char **argv, int block_size, dim3 &dimsA, dim3 &dim
     // Setup execution parameters
 	//dim3 grid(1, 1); //zad1
     
-    dim3 threads(BLOCK_SIZE, BLOCK_SIZE);
-	dim3 grid(dimsB.x / threads.x , dimsA.y / threads.y); // zad3
+    //dim3 threads(BLOCK_SIZE, BLOCK_SIZE);
+	//dim3 grid(dimsB.x / threads.x , dimsA.y / threads.y); // zad3
 
-	//dim3 threads(ZAD5_BLOCK_SIZE, ZAD5_BLOCK_SIZE);
-	//dim3 grid(dimsB.x / (threads.x * SUB_MATRIX_THREAD), dimsA.y / (threads.y * SUB_MATRIX_THREAD));
+	dim3 threads(ZAD5_BLOCK_SIZE, ZAD5_BLOCK_SIZE);
+	dim3 grid(dimsB.x / (threads.x * SUB_MATRIX_THREAD), dimsA.y / (threads.y * SUB_MATRIX_THREAD));
 
 	cudaDeviceSynchronize();
 
@@ -315,8 +314,8 @@ int matrixMultiply(int argc, char **argv, int block_size, dim3 &dimsA, dim3 &dim
     for (int j = 0; j < nIter; j++)
     {
 		//matrixMulGlobalMem<<< grid, threads >>>(d_C, d_A, d_B, dimsA.x);					//zad1
-		matrixMulSharedMultiBlock<<<grid, threads>>>(d_C, d_A, d_B, dimsA.x, dimsB.x);				//zad3
-		//matrixMulNeighbours <<< grid, threads >>> (d_C, d_A, d_B, dimsA.x, dimsB.x);		//zad5
+		//matrixMulSharedMultiBlock<<<grid, threads>>>(d_C, d_A, d_B, dimsA.x, dimsB.x);				//zad3
+		matrixMulNeighbours <<< grid, threads >>> (d_C, d_A, d_B, dimsA.x, dimsB.x);		//zad5
 	}
 
 #pragma region Error handling
@@ -511,7 +510,7 @@ int main(int argc, char **argv)
     printf("MatrixA(%d,%d), MatrixB(%d,%d)\n", dimsA.x, dimsA.y, dimsB.x, dimsB.y);
 #pragma endregion
 
-    int matrix_result = matrixMultiply(argc, argv, BLOCK_SIZE, dimsA, dimsB); //zad 1 3
-	//int matrix_result = matrixMultiply(argc, argv, ZAD5_BLOCK_SIZE, dimsA, dimsB); //zad5
+    //int matrix_result = matrixMultiply(argc, argv, BLOCK_SIZE, dimsA, dimsB); //zad 1 3
+	int matrix_result = matrixMultiply(argc, argv, ZAD5_BLOCK_SIZE, dimsA, dimsB); //zad5
 	//system("pause");
 }
